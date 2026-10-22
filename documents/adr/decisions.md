@@ -94,3 +94,32 @@ Every admin action writes a row to `audit_log` inside the same transaction as th
 ## Admin Feature Flags
 
 **Decision:** Implements `backend-spec-admin-feature-flags.md` (library-portal repo). Changeset 014 adds `feature_flag` keyed by the flag `key` (immutable, so no surrogate id). `updated_by` is a plain username with no FK, like `uploaded_by` on books, so flags outlive the admin who last touched them. Create, toggle and delete write `admin.feature_flag.*` audit entries in the same transaction; a PATCH that doesn't change `enabled` is a no-op (no audit entry, `updatedAt` untouched). The spec doesn't name a code for a malformed `description`/`enabled`, so those return `422 admin.featureFlags.invalidFields`. Writes share the 60/min `/admin` mutation limiter. `GET /admin/feature-flags` is open to any authenticated user (registered before the admin guard); writes stay admin-only. Nothing in the portal reads flags yet; add a read path when one does.
+
+---
+
+## Multi-Factor Authentication (TOTP)
+
+**Decision:** Opt-in TOTP (RFC 6238) as a second factor, per the MFA spec in issue #<issue>. Codes are generated and checked with `otplib`, the first auth dependency since `jsonwebtoken`/`bcryptjs`; TOTP is HMAC-based and should not be hand-rolled. `src/lib/totp.js` is the only file that imports it, so a future major-version rewrite (v12 → v13 already changed the whole API) touches one file. Codes are 6 digits, SHA-1, 30-second steps, accepted within ±1 step for clock drift; secrets are 20 random bytes (RFC 4226 §4), Base32-encoded for authenticator apps.
+
+**Secret storage:** the server needs the original seed to compute codes, so it cannot be hashed like a password. Seeds are encrypted with AES-256-GCM (`src/lib/secretBox.js`, `node:crypto`, no extra dependency) under `MFA_ENCRYPTION_KEY`, an env-only key with the same posture as `JWT_SECRET`. The user id is bound as additional authenticated data, so a ciphertext copied to another row fails to decrypt. Losing the key makes every enrolled secret unreadable (users re-enroll); back it up separately from the database.
+
+**Tokens:** the challenge token returned by `POST /auth/login` is signed with its own `type: 'mfa'` and a short TTL. `authenticate` now accepts only `type === 'access'` (an allowlist instead of the previous `refresh` denylist), so no token type added later can reach protected routes by accident. The challenge token is single-use: it is revoked through the `jti` denylist (ADR "JWT Logout and Token Refresh") on success.
+
+**Step-up:** sensitive actions compose `authenticate` → `requireTotp`, which reads a fresh code from the `X-MFA-Code` header on every request. This applies to disabling MFA, to `setup` when MFA is already active (otherwise a stolen bearer token could swap the victim's secret for the attacker's device), and to `PATCH /users/me/password`. Replay is blocked by storing the last accepted time step per user.
+
+**Wrong code → 400/403, never 401:** the portal treats any 401 as an expired session (refresh, then logout), so a mistyped code would sign the user out. 401 stays reserved for invalid or expired tokens, consistent with the Admin Area's 403 rule.
+
+**Failed attempts:** counted in an in-process `Map<userId, { count, lastAttempt }>` (module-level singleton), not in the database. An attempt is reserved synchronously before any `await`, so parallel requests cannot slip past the limit. After 10 failures, the 11th disables the account (`is_active = false`), which also invalidates every existing session through `isSessionValid`; the change is audited as `user.mfa.locked`. A successful code clears the user's entry. Entries expire 5 minutes after the last attempt: checked on read for correctness, and swept every minute by an unref'd `setInterval` to bound memory. Error responses include the remaining attempts.
+- The limit applies to every code check, including enrollment confirmation (`POST /auth/mfa/verify`): ten wrong codes in a row are not a user still learning the app, and one rule for every check point keeps the logic branch-free.
+- Disabling the account also removes its counter, so a re-enabled user starts with a fresh set of attempts.
+- A locked user is re-enabled by an admin through `PATCH /admin/users/:username`. The lockout bypasses the `LAST_ADMIN` guard on purpose; if the last enabled admin is locked out, recovery is manual:
+  `UPDATE "user" SET is_active = true WHERE username = '<admin>';` and, if the device was lost, `DELETE FROM mfa WHERE user_id = <id>;` to drop the enrollment.
+
+**Why not the alternatives:**
+- *SMS / e-mail codes* — need a messaging provider or SMTP, which the project excludes; SMS is also vulnerable to SIM swapping.
+- *WebAuthn / passkeys* — phishing-resistant and the stronger long-term option, but a larger change (relying-party setup, per-device credentials) than this scope.
+- *Hand-rolled HOTP/TOTP on `node:crypto`* — short, but security code without the library's validation guardrails and maintenance; `otplib`'s default crypto (`@noble/hashes`, `@scure/base`) is independently audited.
+- *Counting attempts in the database* — durable and shared across instances, but chosen against to keep MFA verification free of extra writes and consistent with the existing in-memory rate limiter.
+- *An `mfa: true` claim trusted for the token's lifetime* — a stolen token would carry blanket access to every gated action; step-up re-checks a code per request instead.
+
+**Trade-offs accepted:** TOTP does not stop real-time phishing (a fake site can relay a code within its 30-second window). Attempt counters reset on restart and are per-process; if the API ever runs as multiple instances, move them to a shared store, like the rate limiter.

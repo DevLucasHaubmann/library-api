@@ -27,6 +27,7 @@
     "dotenv": "^16.4.5",
     "express": "^4.19.2",
     "jsonwebtoken": "^9.0.2",
+    "otplib": "^13.5.0",
     "prisma": "^5.14.0"
   },
   "devDependencies": {
