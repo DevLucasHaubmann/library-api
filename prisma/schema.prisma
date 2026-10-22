@@ -31,6 +31,7 @@ model User {
   readerPreferences  Json?             @map("reader_preferences")
   readingProgress    ReadingProgress[]
   bookmarks          Bookmark[]
+  mfa                Mfa?
 
   @@map("user")
 }
@@ -139,4 +140,23 @@ model FeatureFlag {
   updatedBy   String?  @map("updated_by")
 
   @@map("feature_flag")
+}
+
+// MFA (TOTP) state, one row per user, created on the first setup call. `secret` and
+// `pendingSecret` hold AES-256-GCM ciphertexts from src/lib/secretBox.js, never plaintext.
+// A CHECK constraint that exists only in liquibase/changesets keeps `enabled` equal to
+// `secret IS NOT NULL` (Prisma cannot model CHECK constraints). See ADR "Multi-Factor
+// Authentication (TOTP)".
+model Mfa {
+  id            Int      @id @default(autoincrement())
+  userId        Int      @unique @map("user_id")
+  secret        String?
+  pendingSecret String?  @map("pending_secret")
+  enabled       Boolean  @default(false)
+  lastUsedStep  Int?     @map("last_used_step")
+  createdAt     DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt     DateTime @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(3)
+  user          User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@map("mfa")
 }
